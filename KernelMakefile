@@ -1,7 +1,7 @@
 TARGET_BOARD_PLATFORM := clovertrail
 TARGET_DEVICE := hd
-PRODUCT_OUT := out/target/product/T00F
-KERNEL_DIFFCONFIG := kernel/asus/T00F/defconfig
+PRODUCT_OUT := out/target/product/redhookbay
+KERNEL_DIFFCONFIG := kernel/lenovo/redhookbay/defconfig
 
 TARGET_ARCH := x86
 TARGET_ARCH_VARIANT := x86-atom
@@ -16,7 +16,7 @@ TARGET_PROVIDES_INIT_RC := true
 TARGET_USERIMAGES_USE_EXT4 := true
 TARGET_RIL_DISABLE_STATUS_POLLING := true
 TARGET_BOARD_KERNEL_HEADERS := $(COMMON_PATH)/kernel-headers
-KERNEL_SRC_DIR ?= kernel/asus/T00F/kernel
+KERNEL_SRC_DIR ?= kernel/lenovo/redhookbay/kernel
 
 TARGET_TOOLS_PREFIX := prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin/x86_64-linux-android-
 TARGET_CC := prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin/x86_64-linux-android-gcc
@@ -25,6 +25,6 @@ MINIGZIP := out/host/linux-x86/bin/minigzip
 
 $(info KERNEL_DIFFCONFIG ${KERNEL_DIFFCONFIG} )
 
-include kernel/asus/T00F/AndroidKernel.mk
+include kernel/lenovl/redhookbay/AndroidKernel.mk
 
 build_kernel: $(PRODUCT_OUT)/kernel
