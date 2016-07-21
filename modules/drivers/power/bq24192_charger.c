@@ -43,11 +43,16 @@
 #include <linux/gpio.h>
 #include <linux/wakelock.h>
 #include <linux/version.h>
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
 #include <linux/usb/otg.h>
 #include <linux/platform_data/intel_mid_remoteproc.h>
+#else
+#include <linux/usb/penwell_otg.h>
+#include <asm/intel_mid_remoteproc.h>
+#endif
+
 #include <linux/rpmsg.h>
-#include <linux/acpi.h>
-#include <linux/acpi_gpio.h>
 
 #include <asm/intel_mid_gpadc.h>
 #include <asm/intel_scu_ipc.h>
@@ -96,16 +101,11 @@
 #define BQ24192_POWER_ON_CFG_REG		0x1
 #define POWER_ON_CFG_RESET			(1 << 7)
 #define POWER_ON_CFG_I2C_WDTTMR_RESET		(1 << 6)
-/* BQ2419X series charger and OTG enable bits */
 #define CHR_CFG_BIT_POS				4
 #define CHR_CFG_BIT_LEN				2
-#define CHR_CFG_CHRG_MASK			3
 #define POWER_ON_CFG_CHRG_CFG_DIS		(0 << 4)
 #define POWER_ON_CFG_CHRG_CFG_EN		(1 << 4)
 #define POWER_ON_CFG_CHRG_CFG_OTG		(3 << 4)
-/* BQ2429X series charger and OTG enable bits */
-#define POWER_ON_CFG_BQ29X_OTG_EN		(1 << 5)
-#define POWER_ON_CFG_BQ29X_CHRG_EN		(1 << 4)
 #define POWER_ON_CFG_BOOST_LIM			(1 << 0)
 
 /*
@@ -168,7 +168,6 @@
 
 #define BQ24192_SYSTEM_STAT_REG			0x8
 /* D6, D7 show VBUS status */
-#define SYSTEM_STAT_VBUS_BITS			(3 << 6)
 #define SYSTEM_STAT_VBUS_UNKNOWN		0
 #define SYSTEM_STAT_VBUS_HOST			(1 << 6)
 #define SYSTEM_STAT_VBUS_ADP			(2 << 6)
@@ -188,13 +187,11 @@
 #define FAULT_STAT_WDT_TMR_EXP			(1 << 7)
 #define FAULT_STAT_OTG_FLT			(1 << 6)
 /* D4, D5 show charger fault status */
-#define FAULT_STAT_CHRG_BITS			(3 << 4)
 #define FAULT_STAT_CHRG_NORMAL			(0 << 4)
 #define FAULT_STAT_CHRG_IN_FLT			(1 << 4)
 #define FAULT_STAT_CHRG_THRM_FLT		(2 << 4)
 #define FAULT_STAT_CHRG_TMR_FLT			(3 << 4)
 #define FAULT_STAT_BATT_FLT			(1 << 3)
-#define FAULT_STAT_BATT_TEMP_BITS		(3 << 0)
 
 #define BQ24192_VENDER_REV_REG			0xA
 /* D3, D4, D5 indicates the chip model number */
@@ -202,8 +199,6 @@
 #define BQ24191_IC_VERSION			0x1
 #define BQ24192_IC_VERSION			0x2
 #define BQ24192I_IC_VERSION			0x3
-#define BQ24296_IC_VERSION			0x4
-#define BQ24297_IC_VERSION			0xC
 
 #define BQ24192_MAX_MEM		12
 #define NR_RETRY_CNT		3
@@ -213,7 +208,6 @@
 #define CHARGER_TASK_JIFFIES		(HZ * 150)/* 150sec */
 #define CHARGER_HOST_JIFFIES		(HZ * 60) /* 60sec */
 #define FULL_THREAD_JIFFIES		(HZ * 30) /* 30sec */
-#define TEMP_THREAD_JIFFIES		(HZ * 30) /* 30sec */
 
 #define BATT_TEMP_MAX_DEF	60	/* 60 degrees */
 #define BATT_TEMP_MIN_DEF	0
@@ -239,19 +233,12 @@ enum bq24192_chrgr_stat {
 	BQ24192_CHRGR_STAT_LOW_SUPPLY_FAULT
 };
 
-enum bq24192_chip_type {
-	BQ24190, BQ24191, BQ24192,
-	BQ24192I, BQ24296, BQ24297
-};
-
 struct bq24192_chip {
 	struct i2c_client *client;
 	struct bq24192_platform_data *pdata;
-	enum bq24192_chip_type chip_type;
 	struct power_supply usb;
 	struct delayed_work chrg_task_wrkr;
 	struct delayed_work chrg_full_wrkr;
-	struct delayed_work chrg_temp_wrkr;
 	struct work_struct otg_evt_work;
 	struct notifier_block	otg_nb;
 	struct list_head	otg_queue;
@@ -280,13 +267,11 @@ struct bq24192_chip {
 	int irq;
 	bool is_charger_enabled;
 	bool is_charging_enabled;
-	bool a_bus_enable;
+	bool votg;
 	bool is_pwr_good;
 	bool boost_mode;
 	bool online;
 	bool present;
-	bool sfttmr_expired;
-	bool is_otg_present;
 };
 
 #ifdef CONFIG_DEBUG_FS
@@ -536,7 +521,7 @@ static int bq24192_clear_hiz(struct bq24192_chip *chip)
 			bq24192_dump_registers(chip);
 #endif
 			/* Clear the Charger from Hi-Z mode */
-			ret &= ~INPUT_SRC_CNTL_EN_HIZ;
+			ret = (chip->inlmt & ~INPUT_SRC_CNTL_EN_HIZ);
 
 			/* Write the values back */
 			ret = bq24192_write_reg(chip->client,
@@ -641,7 +626,11 @@ int bq24192_get_charger_health(void)
 			"read reg failed %s\n", __func__);
 		return POWER_SUPPLY_HEALTH_UNKNOWN;
 	}
-	/* Check if the error VIN condition occured */
+
+	if (ret_fault & FAULT_STAT_OTG_FLT)
+		return POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+
+	/* Check if the WeakVIN condition occured */
 	ret_status = bq24192_read_reg(chip->client, BQ24192_SYSTEM_STAT_REG);
 	if (ret_status < 0) {
 		dev_warn(&chip->client->dev,
@@ -649,12 +638,8 @@ int bq24192_get_charger_health(void)
 		return POWER_SUPPLY_HEALTH_UNKNOWN;
 	}
 
-	if (!(ret_status & SYSTEM_STAT_PWR_GOOD) &&
-	((ret_fault & FAULT_STAT_CHRG_BITS) == FAULT_STAT_CHRG_IN_FLT))
-		return POWER_SUPPLY_HEALTH_OVERVOLTAGE;
-
-	if (!(ret_status & SYSTEM_STAT_PWR_GOOD) &&
-	((ret_status & SYSTEM_STAT_VBUS_BITS) == SYSTEM_STAT_VBUS_UNKNOWN))
+	if (!(ret_status & SYSTEM_STAT_PWR_GOOD) ||
+	((ret_fault & FAULT_STAT_CHRG_IN_FLT) == FAULT_STAT_CHRG_IN_FLT))
 		return POWER_SUPPLY_HEALTH_DEAD;
 
 	return POWER_SUPPLY_HEALTH_GOOD;
@@ -667,8 +652,10 @@ int bq24192_get_charger_health(void)
  */
 int bq24192_get_battery_health(void)
 {
-	int  temp,vnow;
+	int temp;
 	struct bq24192_chip *chip;
+	int vnow;
+
 	if (!bq24192_client)
 		return POWER_SUPPLY_HEALTH_UNKNOWN;
 
@@ -693,6 +680,7 @@ int bq24192_get_battery_health(void)
 	if ((temp <= chip->min_temp) ||
 		(temp > chip->max_temp))
 		return POWER_SUPPLY_HEALTH_OVERHEAT;
+
 	/* read the battery voltage */
 	vnow = fg_chip_get_property(POWER_SUPPLY_PROP_VOLTAGE_NOW);
 	if (vnow == -ENODEV || vnow == -EINVAL) {
@@ -718,24 +706,13 @@ EXPORT_SYMBOL(bq24192_get_battery_health);
  * into equivalent register setting.
  * Note: ilim must be in mA.
  */
-static int chrg_ilim_to_reg(int ilim)
+static u8 chrg_ilim_to_reg(int ilim)
 {
-	int reg;
-	struct bq24192_chip *chip;
+	u8 reg;
 
-	if (!bq24192_client)
-		return -ENODEV;
+	/* set voltage to 5V */
+	reg = INPUT_SRC_VOLT_LMT_DEF;
 
-	chip = i2c_get_clientdata(bq24192_client);
-
-	reg = bq24192_read_reg(chip->client, BQ24192_INPUT_SRC_CNTL_REG);
-
-	if (reg < 0) {
-		dev_info(&chip->client->dev, "read failed %d", reg);
-		return reg;
-	}
-
-	reg &= ~INPUT_SRC_CUR_LMT7;
 
 	/* Set the input source current limit
 	 * between 100 to 1500mA */
@@ -749,14 +726,9 @@ static int chrg_ilim_to_reg(int ilim)
 		reg |= INPUT_SRC_CUR_LMT3;
 	else if (ilim <= 1200)
 		reg |= INPUT_SRC_CUR_LMT4;
-	else if (ilim <= 1500)
+	else
 		reg |= INPUT_SRC_CUR_LMT5;
-	else if (ilim <= 2000)
-		reg |= INPUT_SRC_CUR_LMT6;
-	else if (ilim <= 3000)
-		reg |= INPUT_SRC_CUR_LMT7;
-	else /* defaulting to 500MA*/
-		reg |= INPUT_SRC_CUR_LMT2;
+
 	return reg;
 }
 
@@ -874,8 +846,11 @@ static int program_timers(struct bq24192_chip *chip, int wdt_duration,
 	/* Program the time with duration passed */
 	ret |=  wdt_duration;
 
-	/* Disable the safety timer for MTBF test. */
-	ret &= ~CHRG_TIMER_EXP_CNTL_EN_TIMER;
+	/* Enable/Disable the safety timer */
+	if (sfttmr_enable)
+		ret |= CHRG_TIMER_EXP_CNTL_EN_TIMER;
+	else
+		ret &= ~CHRG_TIMER_EXP_CNTL_EN_TIMER;
 
 	/* Program the TIMER CTRL register */
 	ret = bq24192_write_reg(chip->client,
@@ -925,7 +900,7 @@ static int bq24192_modify_vindpm(u8 vindpm)
 	}
 
 	/* Assign the return value of REG00 to vindpm_prev */
-	vindpm_prev = (ret & INPUT_SRC_VINDPM_MASK);
+	vindpm_prev = ret & INPUT_SRC_VINDPM_MASK;
 	ret &= ~INPUT_SRC_VINDPM_MASK;
 
 	/*
@@ -951,7 +926,7 @@ static int bq24192_turn_otg_vbus(struct bq24192_chip *chip, bool votg_on)
 
 	dev_info(&chip->client->dev, "%s %d\n", __func__, votg_on);
 
-	if (votg_on && chip->a_bus_enable) {
+	if (votg_on) {
 			/* Program the timers */
 			ret = program_timers(chip,
 						CHRG_TIMER_EXP_CNTL_WDT80SEC,
@@ -961,20 +936,8 @@ static int bq24192_turn_otg_vbus(struct bq24192_chip *chip, bool votg_on)
 					"TIMER enable failed %s\n", __func__);
 				goto i2c_write_fail;
 			}
-
-			/* Clear HIZ mode before OTG mode is enabled */
-			ret = bq24192_clear_hiz(chip);
-			if (ret < 0)
-				dev_warn(&chip->client->dev, "HiZ clear failed:\n");
-
 			/* Configure the charger in OTG mode */
-			if ((chip->chip_type == BQ24296) ||
-				(chip->chip_type == BQ24297))
-				ret = bq24192_reg_read_modify(chip->client,
-					BQ24192_POWER_ON_CFG_REG,
-					POWER_ON_CFG_BQ29X_OTG_EN, true);
-			else
-				ret = bq24192_reg_read_modify(chip->client,
+			ret = bq24192_reg_read_modify(chip->client,
 					BQ24192_POWER_ON_CFG_REG,
 					POWER_ON_CFG_CHRG_CFG_OTG, true);
 			if (ret < 0) {
@@ -1001,13 +964,7 @@ static int bq24192_turn_otg_vbus(struct bq24192_chip *chip, bool votg_on)
 						0);
 	} else {
 			/* Clear the charger from the OTG mode */
-			if ((chip->chip_type == BQ24296) ||
-				(chip->chip_type == BQ24297))
-				ret = bq24192_reg_read_modify(chip->client,
-					BQ24192_POWER_ON_CFG_REG,
-					POWER_ON_CFG_BQ29X_OTG_EN, false);
-			else
-				ret = bq24192_reg_read_modify(chip->client,
+			ret = bq24192_reg_read_modify(chip->client,
 					BQ24192_POWER_ON_CFG_REG,
 					POWER_ON_CFG_CHRG_CFG_OTG, false);
 			if (ret < 0) {
@@ -1034,7 +991,7 @@ static int bq24192_turn_otg_vbus(struct bq24192_chip *chip, bool votg_on)
 	 *  Drive the gpio to turn ON/OFF the VBUS
 	 */
 	if (chip->pdata->drive_vbus)
-		chip->pdata->drive_vbus(votg_on && chip->a_bus_enable);
+		chip->pdata->drive_vbus(votg_on);
 
 	return ret;
 i2c_write_fail:
@@ -1152,7 +1109,8 @@ static inline void bq24192_remove_debugfs(struct bq24192_chip *chip)
 static inline int bq24192_enable_charging(
 			struct bq24192_chip *chip, bool val)
 {
-	int ret, regval;
+	int ret;
+	u8 regval;
 
 	dev_warn(&chip->client->dev, "%s:%d %d\n", __func__, __LINE__, val);
 
@@ -1171,19 +1129,15 @@ static inline int bq24192_enable_charging(
 	 */
 	regval = chrg_ilim_to_reg(chip->inlmt);
 
-	if (regval < 0) {
-		dev_err(&chip->client->dev,
-			"read ilim failed: %d\n", regval);
-		return regval;
-	}
-
 	ret = bq24192_write_reg(chip->client, BQ24192_INPUT_SRC_CNTL_REG,
 				regval);
 	if (ret < 0) {
 		dev_err(&chip->client->dev,
-			"inlmt programming failed: %d\n", ret);
+				"inlmt programming failed: %d\n", ret);
 		return ret;
 	}
+
+	ret = val ? POWER_ON_CFG_CHRG_CFG_EN : POWER_ON_CFG_CHRG_CFG_DIS;
 
 	/*
 	 * check if we have the battery emulator connected. We do not start
@@ -1202,6 +1156,10 @@ static inline int bq24192_enable_charging(
 		return ret;
 	}
 
+	ret = bq24192_reg_multi_bitset(chip->client,
+					BQ24192_POWER_ON_CFG_REG,
+					ret, CHR_CFG_BIT_POS,
+					CHR_CFG_BIT_LEN);
 	if (val) {
 		/* Schedule the charger task worker now */
 		schedule_delayed_work(&chip->chrg_task_wrkr, 0);
@@ -1232,38 +1190,9 @@ static inline int bq24192_enable_charging(
 		/* If no charger connected, cancel the workers */
 		if (!(ret & SYSTEM_STAT_VBUS_OTG)) {
 			dev_info(&chip->client->dev, "NO charger connected\n");
-			chip->sfttmr_expired = false;
 			cancel_delayed_work_sync(&chip->chrg_task_wrkr);
 		}
 	}
-
-	if (chip->sfttmr_expired)
-		return ret;
-
-	ret = bq24192_read_reg(chip->client, BQ24192_POWER_ON_CFG_REG);
-	if (ret < 0) {
-		dev_err(&chip->client->dev,
-				"pwr cfg read failed: %d\n", ret);
-		return ret;
-	}
-
-	if ((chip->chip_type == BQ24296) || (chip->chip_type == BQ24297)) {
-		if (val)
-			regval = ret | POWER_ON_CFG_BQ29X_CHRG_EN;
-		else
-			regval = ret & ~POWER_ON_CFG_BQ29X_CHRG_EN;
-	} else {
-		/* clear the charge enbale bit mask first */
-		ret &= ~(CHR_CFG_CHRG_MASK << CHR_CFG_BIT_POS);
-		if (val)
-			regval = ret | POWER_ON_CFG_CHRG_CFG_EN;
-		else
-			regval = ret | POWER_ON_CFG_CHRG_CFG_DIS;
-	}
-
-	ret = bq24192_write_reg(chip->client, BQ24192_POWER_ON_CFG_REG, regval);
-	if (ret < 0)
-		dev_warn(&chip->client->dev, "charger enable/disable failed\n");
 
 	return ret;
 }
@@ -1271,21 +1200,10 @@ static inline int bq24192_enable_charging(
 static inline int bq24192_enable_charger(
 			struct bq24192_chip *chip, int val)
 {
-	int ret = 0;
-
-	ret = bq24192_reg_read_modify(chip->client,
-			BQ24192_INPUT_SRC_CNTL_REG,
-				INPUT_SRC_CNTL_EN_HIZ, !val);
-
-	if (ret < 0)
-		dev_warn(&chip->client->dev,
-				"Input src cntl write failed\n");
-	else
-		ret = bq24192_enable_charging(chip, val);
 
 	dev_warn(&chip->client->dev, "%s:%d %d\n", __func__, __LINE__, val);
 
-	return ret;
+	return bq24192_enable_charging(chip, val);
 }
 
 static inline int bq24192_set_cc(struct bq24192_chip *chip, int cc)
@@ -1312,14 +1230,11 @@ static inline int bq24192_set_cv(struct bq24192_chip *chip, int cv)
 
 static inline int bq24192_set_inlmt(struct bq24192_chip *chip, int inlmt)
 {
-	int regval;
+	u8 regval;
 
 	dev_warn(&chip->client->dev, "%s:%d %d\n", __func__, __LINE__, inlmt);
 	chip->inlmt = inlmt;
 	regval = chrg_ilim_to_reg(inlmt);
-
-	if (regval < 0)
-		return regval;
 
 	return bq24192_write_reg(chip->client, BQ24192_INPUT_SRC_CNTL_REG,
 				regval);
@@ -1603,10 +1518,8 @@ static irqreturn_t bq24192_irq_thread(int irq, void *devid)
 
 	if (reg_status == SYSTEM_STAT_CHRG_DONE) {
 		dev_warn(&chip->client->dev, "HW termination happened\n");
-		mutex_lock(&chip->event_lock);
 		bq24192_enable_hw_term(chip, false);
 		bq24192_resume_charging(chip);
-		mutex_unlock(&chip->event_lock);
 		/* schedule the thread to let the framework know about FULL */
 		schedule_delayed_work(&chip->chrg_full_wrkr, 0);
 	}
@@ -1627,24 +1540,12 @@ static irqreturn_t bq24192_irq_thread(int irq, void *devid)
 		if (chip->is_charging_enabled) {
 			program_timers(chip,
 					CHRG_TIMER_EXP_CNTL_WDT160SEC, true);
-			mutex_lock(&chip->event_lock);
 			bq24192_resume_charging(chip);
-			mutex_unlock(&chip->event_lock);
 		} else
 			dev_info(&chip->client->dev, "No charger connected\n");
 	}
-	if ((reg_fault & FAULT_STAT_CHRG_TMR_FLT) == FAULT_STAT_CHRG_TMR_FLT) {
-		chip->sfttmr_expired = true;
-		dev_info(&chip->client->dev, "Safety timer expired\n");
-	}
 	if (reg_status != SYSTEM_STAT_CHRG_DONE)
 		power_supply_changed(&chip->usb);
-
-	if (reg_fault & FAULT_STAT_BATT_TEMP_BITS) {
-		dev_info(&chip->client->dev,
-			"%s:Battery over temp occured!!!!\n", __func__);
-		schedule_delayed_work(&chip->chrg_temp_wrkr, 0);
-	}
 
 	return IRQ_HANDLED;
 }
@@ -1661,9 +1562,7 @@ static void bq24192_task_worker(struct work_struct *work)
 	dev_info(&chip->client->dev, "%s\n", __func__);
 
 	/* Reset the WDT */
-	mutex_lock(&chip->event_lock);
 	ret = reset_wdt_timer(chip);
-	mutex_unlock(&chip->event_lock);
 	if (ret < 0)
 		dev_warn(&chip->client->dev, "WDT reset failed:\n");
 
@@ -1676,12 +1575,10 @@ static void bq24192_task_worker(struct work_struct *work)
 		goto sched_task_work;
 	}
 
-	if (!(chip->cntl_state == 0x3)) {
-		/* Clear the charger from Hi-Z */
-		ret = bq24192_clear_hiz(chip);
-		if (ret < 0)
-			dev_warn(&chip->client->dev, "HiZ clear failed:\n");
-	}
+	/* Clear the charger from Hi-Z */
+	ret = bq24192_clear_hiz(chip);
+	if (ret < 0)
+		dev_warn(&chip->client->dev, "HiZ clear failed:\n");
 
 	/* Modify the VINDPM */
 
@@ -1700,28 +1597,22 @@ static void bq24192_task_worker(struct work_struct *work)
 	if (vbatt <= INPUT_SRC_LOW_VBAT_LIMIT)
 		goto sched_task_work;
 
-	/* The charger vindpm voltage changes are causing charge current throttle
-	 * resulting in a prolonged changing time.
-	 * Hence disabling dynamic vindpm update  for bq24296 chip.
-	*/
-	if (chip->chip_type != BQ24296) {
-		if (vbatt > INPUT_SRC_LOW_VBAT_LIMIT &&
-			vbatt < INPUT_SRC_MIDL_VBAT_LIMIT)
-			vindpm = INPUT_SRC_VOLT_LMT_444;
-		else if (vbatt > INPUT_SRC_MIDL_VBAT_LIMIT &&
-			vbatt < INPUT_SRC_MIDH_VBAT_LIMIT)
-			vindpm = INPUT_SRC_VOLT_LMT_468;
-		else if (vbatt > INPUT_SRC_MIDH_VBAT_LIMIT &&
-			vbatt < INPUT_SRC_HIGH_VBAT_LIMIT)
-			vindpm = INPUT_SRC_VOLT_LMT_476;
+	if (vbatt > INPUT_SRC_LOW_VBAT_LIMIT &&
+		vbatt < INPUT_SRC_MIDL_VBAT_LIMIT)
+		vindpm = INPUT_SRC_VOLT_LMT_444;
+	else if (vbatt > INPUT_SRC_MIDL_VBAT_LIMIT &&
+		vbatt < INPUT_SRC_MIDH_VBAT_LIMIT)
+		vindpm = INPUT_SRC_VOLT_LMT_468;
+	else if (vbatt > INPUT_SRC_MIDH_VBAT_LIMIT &&
+		vbatt < INPUT_SRC_HIGH_VBAT_LIMIT)
+		vindpm = INPUT_SRC_VOLT_LMT_476;
 
-		if (!mutex_trylock(&chip->event_lock))
-			goto sched_task_work;
-		ret = bq24192_modify_vindpm(vindpm);
-		if (ret < 0)
-			dev_err(&chip->client->dev, "%s failed\n", __func__);
-		mutex_unlock(&chip->event_lock);
-	}
+	if (!mutex_trylock(&chip->event_lock))
+		goto sched_task_work;
+	ret = bq24192_modify_vindpm(vindpm);
+	if (ret < 0)
+		dev_err(&chip->client->dev, "%s failed\n", __func__);
+	mutex_unlock(&chip->event_lock);
 
 	/*
 	 * BQ driver depends upon the charger interrupt to send notification
@@ -1771,10 +1662,7 @@ static void bq24192_otg_evt_worker(struct work_struct *work)
 		dev_info(&chip->client->dev,
 			"%s:%d state=%d\n", __FILE__, __LINE__,
 				evt->is_enable);
-
-		chip->is_otg_present = evt->is_enable;
 		ret = bq24192_turn_otg_vbus(chip, evt->is_enable);
-
 		if (ret < 0)
 			dev_err(&chip->client->dev, "VBUS ON FAILED:\n");
 
@@ -1783,73 +1671,6 @@ static void bq24192_otg_evt_worker(struct work_struct *work)
 
 	}
 	spin_unlock_irqrestore(&chip->otg_queue_lock, flags);
-}
-
-
-static void bq24192_temp_update_worker(struct work_struct *work)
-{
-	struct bq24192_chip *chip =
-	    container_of(work, struct bq24192_chip, chrg_temp_wrkr.work);
-	int fault_reg = 0, fg_temp = 0;
-	static bool is_otp_notified;
-
-	dev_info(&chip->client->dev, "%s\n", __func__);
-	/* Check if battery fault condition occured. Reading the register
-	   value two times to get reliable reg value, recommended by vendor*/
-	fault_reg = bq24192_read_reg(chip->client, BQ24192_FAULT_STAT_REG);
-	if (fault_reg < 0) {
-		dev_err(&chip->client->dev,
-			"Fault status read failed: %d\n", fault_reg);
-		goto temp_wrkr_error;
-	}
-	fault_reg = bq24192_read_reg(chip->client, BQ24192_FAULT_STAT_REG);
-	if (fault_reg < 0) {
-		dev_err(&chip->client->dev,
-			"Fault status read failed: %d\n", fault_reg);
-		goto temp_wrkr_error;
-	}
-
-	fg_temp = fg_chip_get_property(POWER_SUPPLY_PROP_TEMP);
-	if (fg_temp == -ENODEV || fg_temp == -EINVAL) {
-		dev_err(&chip->client->dev,
-			"Failed to read FG temperature\n");
-		/* If failed to read fg temperature, use charger fault
-		 * status to identify the recovery */
-		if (fault_reg & FAULT_STAT_BATT_TEMP_BITS) {
-			schedule_delayed_work(&chip->chrg_temp_wrkr,
-				TEMP_THREAD_JIFFIES);
-		} else {
-			power_supply_changed(&chip->usb);
-		}
-		goto temp_wrkr_error;
-	}
-	fg_temp = fg_temp/10;
-
-	if (fg_temp >= chip->pdata->max_temp
-		|| fg_temp <= chip->pdata->min_temp) {
-		if (!is_otp_notified) {
-			dev_info(&chip->client->dev,
-				"Battery over temp occurred!!!!\n");
-			power_supply_changed(&chip->usb);
-			is_otp_notified = true;
-		}
-	} else if (!(fault_reg & FAULT_STAT_BATT_TEMP_BITS)) {
-		/* over temperature is recovered if battery temp
-		 * is between min_temp to max_temp and charger
-		 * temperature fault bits are cleared */
-		is_otp_notified = false;
-		dev_info(&chip->client->dev,
-			"Battery over temp recovered!!!!\n");
-		power_supply_changed(&chip->usb);
-		/*Return without reschedule as over temp recovered*/
-		return;
-	}
-	schedule_delayed_work(&chip->chrg_temp_wrkr, TEMP_THREAD_JIFFIES);
-	return;
-
-temp_wrkr_error:
-	is_otp_notified = false;
-	return;
 }
 
 static int otg_handle_notification(struct notifier_block *nb,
@@ -1861,8 +1682,7 @@ static int otg_handle_notification(struct notifier_block *nb,
 
 	dev_info(&chip->client->dev, "OTG notification: %lu\n", event);
 
-	if (!param || (event != USB_EVENT_DRIVE_VBUS) &&
-					(event != USB_EVENT_ID))
+	if (!param || event != USB_EVENT_DRIVE_VBUS)
 		return NOTIFY_DONE;
 
 	evt = kzalloc(sizeof(*evt), GFP_ATOMIC);
@@ -1872,11 +1692,7 @@ static int otg_handle_notification(struct notifier_block *nb,
 		return NOTIFY_DONE;
 	}
 
-	if (event == USB_EVENT_DRIVE_VBUS)
-		evt->is_enable = *(bool *)param;
-	else	/* treat id short as drive vbus evt */
-		evt->is_enable = !(*(bool *)param);
-
+	evt->is_enable = *(bool *)param;
 	dev_info(&chip->client->dev, "evt->is_enable is %d\n", evt->is_enable);
 	INIT_LIST_HEAD(&evt->node);
 
@@ -1886,51 +1702,6 @@ static int otg_handle_notification(struct notifier_block *nb,
 
 	queue_work(system_nrt_wq, &chip->otg_evt_work);
 	return NOTIFY_OK;
-}
-
-static void bq24192_usb_otg_enable(struct usb_phy *phy)
-{
-	struct bq24192_chip *chip = i2c_get_clientdata(bq24192_client);
-	int ret, id_value = -1;
-
-	mutex_lock(&chip->event_lock);
-	if (phy->vbus_state == VBUS_DISABLED)
-		chip->a_bus_enable = false;
-	else
-		chip->a_bus_enable = true;
-	mutex_unlock(&chip->event_lock);
-
-	if (phy->get_id_status) {
-		/*get_id_status will store 0 in id_value if otg device is connected*/
-		ret = phy->get_id_status(phy, &id_value);
-		if (ret < 0) {
-			dev_warn(&chip->client->dev,
-				"otg get ID status failed:%d\n", ret);
-			return;
-		} else if (id_value != 0) {
-			/*otg vbus should not be enabled or disabled if otg device is not connected*/
-			return;
-		}
-	} else {
-		dev_err(&chip->client->dev, "get_id_status is not defined for usb_phy");
-		return;
-	}
-
-	mutex_lock(&chip->event_lock);
-
-	if (phy->vbus_state == VBUS_DISABLED) {
-		dev_info(&chip->client->dev, "OTG Disable");
-		ret = bq24192_turn_otg_vbus(chip, false);
-		if (ret < 0)
-			dev_err(&chip->client->dev, "VBUS OFF FAILED:\n");
-	} else {
-		dev_info(&chip->client->dev, "OTG Enable");
-		ret = bq24192_turn_otg_vbus(chip, true);
-		if (ret < 0)
-			dev_err(&chip->client->dev, "VBUS ON FAILED:\n");
-	}
-
-	mutex_unlock(&chip->event_lock);
 }
 
 static inline int register_otg_notification(struct bq24192_chip *chip)
@@ -1947,12 +1718,15 @@ static inline int register_otg_notification(struct bq24192_chip *chip)
 	/*
 	 * Get the USB transceiver instance
 	 */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
 	chip->transceiver = usb_get_phy(USB_PHY_TYPE_USB2);
+#else
+	chip->transceiver = usb_get_transceiver();
+#endif
 	if (!chip->transceiver) {
 		dev_err(&chip->client->dev, "Failed to get the USB transceiver\n");
 		return -EINVAL;
 	}
-	chip->transceiver->a_bus_drop = bq24192_usb_otg_enable;
 	retval = usb_register_notifier(chip->transceiver, &chip->otg_nb);
 	if (retval) {
 		dev_err(&chip->client->dev,
@@ -1968,16 +1742,12 @@ int bq24192_slave_mode_enable_charging(int volt, int cur, int ilim)
 	struct bq24192_chip *chip = i2c_get_clientdata(bq24192_client);
 	int ret;
 
-	mutex_lock(&chip->event_lock);
-	chip->inlmt = ilim;
-	if (chip->inlmt >= 0)
+	chip->inlmt = chrg_ilim_to_reg(ilim);
+	if (chip->inlmt)
 		bq24192_set_inlmt(chip, chip->inlmt);
-	mutex_unlock(&chip->event_lock);
-
 	chip->cc = chrg_cur_to_reg(cur);
 	if (chip->cc)
 		bq24192_set_cc(chip, chip->cc);
-
 	chip->cv = chrg_volt_to_reg(volt);
 	if (chip->cv)
 		bq24192_set_cv(chip, chip->cv);
@@ -2005,57 +1775,18 @@ int bq24192_slave_mode_disable_charging(void)
 	mutex_unlock(&chip->event_lock);
 	return ret;
 }
-static int bq24192_get_chip_version(struct bq24192_chip *chip)
-{
-	int ret;
-
-	/* check chip model number */
-	ret = bq24192_read_reg(chip->client, BQ24192_VENDER_REV_REG);
-	if (ret < 0) {
-		dev_err(&chip->client->dev, "i2c read err:%d\n", ret);
-		return -EIO;
-	}
-	dev_info(&chip->client->dev, "version reg:%x\n", ret);
-
-	ret = ret >> 3;
-	switch (ret) {
-	case BQ24190_IC_VERSION:
-		chip->chip_type = BQ24190;
-		break;
-	case BQ24191_IC_VERSION:
-		chip->chip_type = BQ24191;
-		break;
-	case BQ24192_IC_VERSION:
-		chip->chip_type = BQ24192;
-		break;
-	case BQ24192I_IC_VERSION:
-		chip->chip_type = BQ24192I;
-		break;
-	case BQ24296_IC_VERSION:
-		chip->chip_type = BQ24296;
-		break;
-	case BQ24297_IC_VERSION:
-		chip->chip_type = BQ24297;
-		break;
-	default:
-		dev_err(&chip->client->dev,
-			"device version mismatch: %x\n", ret);
-		return -EIO;
-	}
-
-	dev_info(&chip->client->dev, "chip type:%x\n", chip->chip_type);
-	return 0;
-}
-
-extern void *bq24192_platform_data(void *info);
 
 static int bq24192_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
 	struct bq24192_chip *chip;
-	struct acpi_gpio_info gpio_info;
-	int ret, gpio;
+	int ret;
+
+	if (!client->dev.platform_data) {
+		dev_err(&client->dev, "platform Data is NULL");
+		return -EFAULT;
+	}
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA)) {
 		dev_err(&client->dev,
@@ -2070,29 +1801,27 @@ static int bq24192_probe(struct i2c_client *client,
 	}
 
 	chip->client = client;
-#ifdef CONFIG_ACPI
-	chip->pdata = bq24192_platform_data(NULL);
-#else
 	chip->pdata = client->dev.platform_data;
-#endif
-	if (!chip->pdata) {
-		dev_err(&client->dev, "pdata NULL!!\n");
-		kfree(chip);
-		return -EINVAL;
-	}
-	chip->irq = -1;
-	chip->a_bus_enable = true;
-
 	/*assigning default value for min and max temp*/
-	chip->max_temp = chip->pdata->max_temp;
-	chip->min_temp = chip->pdata->min_temp;
+	chip->min_temp = BATT_TEMP_MIN_DEF;
+	chip->max_temp = BATT_TEMP_MAX_DEF;
 	i2c_set_clientdata(client, chip);
 	bq24192_client = client;
-
-	/* check chip model number */
-	ret = bq24192_get_chip_version(chip);
+	ret = bq24192_read_reg(client, BQ24192_VENDER_REV_REG);
 	if (ret < 0) {
 		dev_err(&client->dev, "i2c read err:%d\n", ret);
+		i2c_set_clientdata(client, NULL);
+		kfree(chip);
+		return -EIO;
+	}
+
+	/* D3, D4, D5 indicates the chip model number */
+	ret = (ret >> 3) & 0x07;
+	if ((ret != BQ24192I_IC_VERSION) &&
+		(ret != BQ24192_IC_VERSION) &&
+		(ret != BQ24191_IC_VERSION) &&
+		(ret != BQ24190_IC_VERSION)) {
+		dev_err(&client->dev, "device version mismatch: %x\n", ret);
 		i2c_set_clientdata(client, NULL);
 		kfree(chip);
 		return -EIO;
@@ -2118,46 +1847,29 @@ static int bq24192_probe(struct i2c_client *client,
 	 * register for an interrupt handler for servicing charger
 	 * interrupts
 	 */
-#ifdef CONFIG_ACPI
-	gpio = acpi_get_gpio_by_index(&client->dev, 0, &gpio_info);
-	if (gpio < 0) {
-		/*
-		 * WA: only untill ACPI issue(BZ: 153221)
-		 * gets fixed in kernel.
-		 */
-		gpio = acpi_get_gpio("\\SB.GPO2", 0x2);
-		if (gpio < 0)
-			dev_warn(&client->dev, "gpio request failed\n");
-	}
-	ret = gpio_request_one(gpio, GPIOF_IN, chip->client->name);
-	if (ret < 0)
-		dev_warn(&client->dev, "gpio dir set failed\n");
-	chip->irq = gpio_to_irq(gpio);
-#else
-	if (chip->pdata->get_irq_number)
+	if (chip->pdata->get_irq_number) {
 		chip->irq = chip->pdata->get_irq_number();
-#endif
-	if (chip->irq < 0) {
-		dev_err(&chip->client->dev,
-			"chgr_int_n GPIO is not available\n");
-	} else {
-		ret = request_threaded_irq(chip->irq,
-				bq24192_irq_isr, bq24192_irq_thread,
-				IRQF_TRIGGER_FALLING, "BQ24192", chip);
-		if (ret) {
-			dev_warn(&bq24192_client->dev,
-				"failed to register irq for pin %d\n",
-				chip->irq);
+		if (chip->irq < 0) {
+			dev_err(&chip->client->dev,
+				"chgr_int_n GPIO is not available\n");
 		} else {
-			dev_warn(&bq24192_client->dev,
-				"registered charger irq for pin %d\n",
-				chip->irq);
+			ret = request_threaded_irq(chip->irq,
+					bq24192_irq_isr, bq24192_irq_thread,
+					IRQF_TRIGGER_FALLING, "BQ24192", chip);
+			if (ret) {
+				dev_warn(&bq24192_client->dev,
+					"failed to register irq for pin %d\n",
+					chip->irq);
+			} else {
+				dev_warn(&bq24192_client->dev,
+					"registered charger irq for pin %d\n",
+					chip->irq);
+			}
 		}
 	}
 
 	INIT_DELAYED_WORK(&chip->chrg_full_wrkr, bq24192_full_worker);
 	INIT_DELAYED_WORK(&chip->chrg_task_wrkr, bq24192_task_worker);
-	INIT_DELAYED_WORK(&chip->chrg_temp_wrkr, bq24192_temp_update_worker);
 	mutex_init(&chip->event_lock);
 
 	/* Initialize the wakelock */
@@ -2174,8 +1886,8 @@ static int bq24192_probe(struct i2c_client *client,
 		chip->usb.num_throttle_states =
 					chip->pdata->num_throttle_states;
 		chip->usb.supported_cables = chip->pdata->supported_cables;
-		chip->max_cc = chip->pdata->max_cc;
-		chip->max_cv = chip->pdata->max_cv;
+		chip->max_cc = 1216;
+		chip->max_cv = 4200;
 		chip->bat_health = POWER_SUPPLY_HEALTH_GOOD;
 		chip->chgr_stat = BQ24192_CHRGR_STAT_UNKNOWN;
 		chip->usb.properties = bq24192_usb_props;
@@ -2213,7 +1925,6 @@ static int bq24192_probe(struct i2c_client *client,
 					"REGISTER OTG NOTIFICATION FAILED\n");
 	}
 
-#ifndef CONFIG_ACPI
 	/* Program the safety charge temperature threshold with default value*/
 	ret =  intel_scu_ipc_iowrite8(MSIC_CHRTMPCTRL,
 				(CHRTMPCTRL_TMPH_45 | CHRTMPCTRL_TMPL_00));
@@ -2221,8 +1932,6 @@ static int bq24192_probe(struct i2c_client *client,
 		dev_err(&chip->client->dev,
 				"IPC Failed with %d error\n", ret);
 	}
-#endif
-
 	return 0;
 }
 
@@ -2273,6 +1982,7 @@ static int bq24192_resume(struct device *dev)
 {
 	struct bq24192_chip *chip = dev_get_drvdata(dev);
 	int ret;
+
 	if (chip->irq > 0) {
 		ret = request_threaded_irq(chip->irq,
 				bq24192_irq_isr, bq24192_irq_thread,
@@ -2287,17 +1997,6 @@ static int bq24192_resume(struct device *dev)
 				chip->irq);
 		}
 	}
-	/*
-	* Make sure we enable 5 volt boost mode
-	* in case of otg device connect
-	*/
-	mutex_lock(&chip->event_lock);
-	if (chip->is_otg_present) {
-		ret = bq24192_turn_otg_vbus(chip, true);
-		if (ret < 0)
-			dev_err(&chip->client->dev, "VBUS ON FAILED:\n");
-	}
-	mutex_unlock(&chip->event_lock);
 	dev_dbg(&chip->client->dev, "bq24192 resume\n");
 	return 0;
 }
@@ -2333,19 +2032,10 @@ static int bq24192_runtime_idle(struct device *dev)
 #endif
 
 static const struct i2c_device_id bq24192_id[] = {
-	{ "bq24192", },
-	{ "TBQ24296", },
+	{ DEV_NAME, 0 },
 	{ },
 };
 MODULE_DEVICE_TABLE(i2c, bq24192_id);
-
-#ifdef CONFIG_ACPI
-static struct acpi_device_id bq24192_acpi_match[] = {
-	{"TBQ24296", },
-	{}
-};
-MODULE_DEVICE_TABLE(acpi, bq24192_acpi_match);
-#endif
 
 static const struct dev_pm_ops bq24192_pm_ops = {
 	.suspend		= bq24192_suspend,
@@ -2360,16 +2050,12 @@ static struct i2c_driver bq24192_i2c_driver = {
 		.name	= DEV_NAME,
 		.owner	= THIS_MODULE,
 		.pm	= &bq24192_pm_ops,
-#ifdef CONFIG_ACPI
-		.acpi_match_table = ACPI_PTR(bq24192_acpi_match),
-#endif
 	},
 	.probe		= bq24192_probe,
 	.remove		= bq24192_remove,
 	.id_table	= bq24192_id,
 };
 
-#ifndef CONFIG_ACPI
 static int bq24192_init(void)
 {
 	return i2c_add_driver(&bq24192_i2c_driver);
@@ -2438,19 +2124,6 @@ static void __exit bq24192_rpmsg_exit(void)
 {
 	return unregister_rpmsg_driver(&bq24192_rpmsg);
 }
-#else
-static int __init bq24192_init(void)
-{
-	return i2c_add_driver(&bq24192_i2c_driver);
-}
-module_init(bq24192_init);
-
-static void __exit bq24192_exit(void)
-{
-	i2c_del_driver(&bq24192_i2c_driver);
-}
-module_exit(bq24192_exit);
-#endif
 
 MODULE_AUTHOR("Ramakrishna Pallala <ramakrishna.pallala@intel.com>");
 MODULE_AUTHOR("Raj Pandey <raj.pandey@intel.com>");
