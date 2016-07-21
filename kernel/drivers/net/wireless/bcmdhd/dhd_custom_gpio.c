@@ -259,15 +259,52 @@ int wifi_get_mac_addr_intel(unsigned char *buf){
 int
 dhd_custom_get_mac_address(unsigned char *buf)
 {
-	int ret = 0;
+#ifdef LENOVO_WIFI_MAC_RAND
+	uint rand_mac = 0;
+#endif
+	void *wifi_mac = NULL;
+	uint len = 0;
+	char wifimac[32] = {0};
+	struct ether_addr ea_null= {{0x80, 0xcf, 0x41, 0x67, 0x00, 0x00}};
+	struct ether_addr ea_wifi= {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
-	WL_TRACE(("%s Enter\n", __FUNCTION__));
+	WL_ERROR(("%s Enter\n", __FUNCTION__));
 	if (!buf)
 		return -EINVAL;
 
 	/* Customer access to MAC address stored outside of DHD driver */
+	wifi_mac = dhd_os_open_image("/data/misc/wifi/wifi_mac.txt");
+	if(NULL == wifi_mac)
+	{
+		WL_ERROR(("%s NOT GET WIFI MAC\n", __FUNCTION__));
+
+#ifdef LENOVO_WIFI_MAC_RAND
+		srandom32((uint)jiffies);
+		rand_mac = random32();
+		sprintf(wifimac,"80:cf:41:67:%02x:%02x",
+			(unsigned char)(rand_mac >> 8),
+			(unsigned char)(rand_mac >> 16));
+#else
+		return -EINVAL;
+#endif /* LENOVO_WIFI_MAC_RAND */
+	}
+	else
+	{
+		len = dhd_os_get_image_block(wifimac, sizeof(wifimac), wifi_mac);
+		dhd_os_close_image(wifi_mac);
+	}
+
+	bcm_ether_atoe(wifimac, &ea_wifi);
+	if( bcmp((char *)&ea_wifi, (char *)&ea_null, (sizeof(struct ether_addr))/2))
+	{
+		WL_ERROR(("Error mac from outside  =[%s]  \n", wifimac));
+		return -EINVAL;
+	}
+
+	bcopy((char *)&ea_wifi, buf, sizeof(struct ether_addr));
+	WL_ERROR((" get_mac_address  =[%s]  \n", wifimac));
 #if defined(CUSTOMER_HW2) && (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
-	ret = wifi_get_mac_addr_intel(buf);
+	/* ret = wifi_get_mac_addr_intel(buf); */
 #endif
 
 #ifdef EXAMPLE_GET_MAC
@@ -278,7 +315,7 @@ dhd_custom_get_mac_address(unsigned char *buf)
 	}
 #endif /* EXAMPLE_GET_MAC */
 
-	return ret;
+	return 0;
 }
 #endif /* GET_CUSTOM_MAC_ENABLE */
 
