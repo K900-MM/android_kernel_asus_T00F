@@ -1,4 +1,3 @@
-ASUS Zenfone 5 Kernel
+Lenovo K900 3.10.20 kernel based on zf5 sources
 =====================
 
-This repository contains the Kernel used by ASUS Zenfone 5 series.
