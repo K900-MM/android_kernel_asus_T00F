@@ -25,6 +25,6 @@ MINIGZIP := out/host/linux-x86/bin/minigzip
 
 $(info KERNEL_DIFFCONFIG ${KERNEL_DIFFCONFIG} )
 
-include kernel/lenovl/redhookbay/AndroidKernel.mk
+include kernel/lenovo/redhookbay/AndroidKernel.mk
 
 build_kernel: $(PRODUCT_OUT)/kernel
